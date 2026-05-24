@@ -22,20 +22,13 @@ BOT_USERNAME        = os.getenv("BOT_USERNAME", "intercitytrans_bot")
 PAYMENT_DETAILS     = os.getenv("PAYMENT_DETAILS", "Для оплаты абонемента свяжитесь с администратором @Olegan7979")
 DB_PATH             = os.getenv("DB_PATH", "intercity_bot.db")
 
-# Проверка, что критически важные переменные заданы
 if not BOT_TOKEN:
     raise ValueError("❌ Не задана переменная окружения BOT_TOKEN!")
 if not YANDEX_GEOCODER_KEY:
     print("⚠️ YANDEX_GEOCODER_KEY не задан — расчёт расстояний не будет работать")
 
-# ═══════════════════════════════════════════════════════════════
-#  ЧАСОВОЙ ПОЯС
-# ═══════════════════════════════════════════════════════════════
 GEO_TZ = timezone(timedelta(hours=4))
 
-# ═══════════════════════════════════════════════════════════════
-#  ТАРИФЫ  ₽/км
-# ═══════════════════════════════════════════════════════════════
 TARIFFS_RF = {
     "econom":    {"label": "⚡️ Эконом",               "price": 25},
     "standard":  {"label": "🚗 Стандарт",              "price": 27},
@@ -79,9 +72,8 @@ ALLOWED_ORDER_COLUMNS = {
     "distance_km", "price"
 }
 
-print("🚕 Запуск Межгород Трансфер Россия v3.3 (SQLite FSM) ...")
+print("🚕 Запуск Межгород Трансфер Россия v4.0 (SQLite FSM, контакты + авторегистрация) ...")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-
 
 # ═══════════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
@@ -100,6 +92,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS drivers (
             user_id         INTEGER PRIMARY KEY,
             name            TEXT,
+            first_name      TEXT,
+            last_name       TEXT,
             car_model       TEXT,
             car_year        INTEGER,
             car_number      TEXT,
@@ -107,6 +101,9 @@ def init_db():
             car_class_label TEXT,
             phone           TEXT,
             username        TEXT,
+            profile_link    TEXT,
+            has_photo       INTEGER DEFAULT 0,
+            bio             TEXT,
             doc_lic_front   TEXT,
             doc_lic_back    TEXT,
             doc_sts_front   TEXT,
@@ -170,11 +167,23 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_orders_driver    ON orders(driver_id);
         CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);
     """)
+    
+    # Добавляем новые колонки, если их нет (для совместимости со старой БД)
+    for col, col_type in [
+        ("first_name", "TEXT"),
+        ("last_name", "TEXT"),
+        ("profile_link", "TEXT"),
+        ("has_photo", "INTEGER DEFAULT 0"),
+        ("bio", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE drivers ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Колонка уже существует
+    
     conn.commit()
     conn.close()
     print("✅ База данных готова")
-
-
 # ═══════════════════════════════════════════════════════════════
 #  СЛОЙ ДАННЫХ — СЕССИИ (FSM)
 # ═══════════════════════════════════════════════════════════════
@@ -209,11 +218,6 @@ def db_clear_session(uid: int):
     conn.commit()
     conn.close()
 
-
-# ═══════════════════════════════════════════════════════════════
-#  СЛОЙ ДАННЫХ — ВОДИТЕЛИ, ПОДПИСКИ, ЗАКАЗЫ, ПРОЧЕЕ
-# ═══════════════════════════════════════════════════════════════
-
 def db_get_driver(uid: int) -> dict | None:
     conn = get_db()
     row = conn.execute("SELECT * FROM drivers WHERE user_id=?", (uid,)).fetchone()
@@ -224,14 +228,17 @@ def db_save_driver(uid: int, data: dict):
     conn = get_db()
     conn.execute("""
         INSERT OR REPLACE INTO drivers
-        (user_id, name, car_model, car_year, car_number, car_class, car_class_label,
-         phone, username, doc_lic_front, doc_lic_back, doc_sts_front, doc_sts_back,
+        (user_id, name, first_name, last_name, car_model, car_year, car_number, car_class, car_class_label,
+         phone, username, profile_link, has_photo, bio,
+         doc_lic_front, doc_lic_back, doc_sts_front, doc_sts_back,
          doc_car, docs_verified, registered_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        uid, data.get("name"), data.get("car_model"), data.get("car_year"),
+        uid, data.get("name"), data.get("first_name"), data.get("last_name"),
+        data.get("car_model"), data.get("car_year"),
         data.get("car_number"), data.get("car_class"), data.get("car_class_label"),
-        data.get("phone"), data.get("username"),
+        data.get("phone"), data.get("username"), data.get("profile_link"),
+        1 if data.get("has_photo") else 0, data.get("bio", ""),
         data.get("doc_lic_front"), data.get("doc_lic_back"),
         data.get("doc_sts_front"), data.get("doc_sts_back"),
         data.get("doc_car"),
@@ -302,7 +309,7 @@ def db_create_order(order: dict) -> int:
         order["trip_date"], order["trip_time"], order["passengers"],
         order["car_class"], order.get("wishes",""),
         order.get("distance_km"), order.get("price"),
-        "pending", datetime.now(GEO_TZ).isoformat(), None, None
+        order.get("status", "pending"), datetime.now(GEO_TZ).isoformat(), None, None
     ))
     oid = cur.lastrowid
     conn.commit()
@@ -429,11 +436,6 @@ def db_all_pending() -> list[dict]:
     conn.close()
     return [dict(r) for r in rows]
 
-
-# ═══════════════════════════════════════════════════════════════
-#  УТИЛИТЫ
-# ═══════════════════════════════════════════════════════════════
-
 def is_nt(city: str) -> bool:
     return any(kw in city.lower() for kw in NT_KEYWORDS)
 
@@ -556,11 +558,6 @@ def fmt_order(order: dict, show_price=True) -> str:
     ]
     return "\n".join(lines)
 
-
-# ═══════════════════════════════════════════════════════════════
-#  КЛАВИАТУРЫ
-# ═══════════════════════════════════════════════════════════════
-
 def kb_main():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row("🚕 Создать заказ", "🚗 Я водитель")
@@ -609,8 +606,6 @@ def kb_subscriptions():
         m.add(types.InlineKeyboardButton(f"💳  {plan['label']}", callback_data=f"sub_{key}"))
     m.add(types.InlineKeyboardButton("◀️ Назад", callback_data="back_driver"))
     return m
-
-
 # ═══════════════════════════════════════════════════════════════
 #  /start  /help  /admin
 # ═══════════════════════════════════════════════════════════════
@@ -669,13 +664,13 @@ def cmd_admin(msg):
         types.InlineKeyboardButton("⛔ Чёрный список",        callback_data="adm_bl"),
         types.InlineKeyboardButton("💳 Ожидают оплаты",      callback_data="adm_subs"),
         types.InlineKeyboardButton("📊 Статистика",           callback_data="adm_stats"),
+        types.InlineKeyboardButton("📖 Список команд",       callback_data="adm_help"),
     )
     bot.send_message(uid,
         "🔧 <b>Панель администратора</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=m
     )
-
 
 # ═══════════════════════════════════════════════════════════════
 #  ГЛАВНОЕ МЕНЮ
@@ -699,7 +694,6 @@ def show_tariffs(msg):
     lines.append("🚫 <i>Торг и снижение тарифа — нарушение правил</i>")
     bot.send_message(msg.chat.id, "\n".join(lines))
 
-
 # ═══════════════════════════════════════════════════════════════
 #  СОЗДАНИЕ ЗАКАЗА — FSM
 # ═══════════════════════════════════════════════════════════════
@@ -722,6 +716,14 @@ def order_start(msg):
 @bot.message_handler(func=lambda m: m.text == "❌ Отменить")
 def order_cancel(msg):
     uid = msg.chat.id
+    s = db_get_session(uid)
+    
+    # Если водитель на шаге отправки контакта — сбрасываем специальную клавиатуру
+    if s.get("step") == "profile_share_contact":
+        db_clear_session(uid)
+        bot.send_message(uid, "❌ Регистрация отменена.", reply_markup=kb_driver(uid))
+        return
+    
     db_clear_session(uid)
     bot.send_message(uid, "❌ Отменено.", reply_markup=kb_main())
 
@@ -847,69 +849,68 @@ def step_wishes(msg):
     db_update_session(uid, data=s["data"])
     finalize_order(uid)
 
-
 def finalize_order(uid):
+    """Расчет цены ДО создания заказа в БД"""
     s = db_get_session(uid)
     data = s["data"]
     db_clear_session(uid)
     
-    oid = db_create_order({
-        "passenger_id": uid,
-        "from_city":    data["from_city"],
-        "to_city":      data["to_city"],
-        "trip_date":    data["trip_date"],
-        "trip_time":    data["trip_time"],
-        "passengers":   data["passengers"],
-        "car_class":    data["car_class"],
-        "wishes":       data.get("wishes",""),
-        "distance_km":  None,
-        "price":        None,
-    })
-    
     bot.send_message(uid,
-        "⏳ <b>Заказ создается...</b>\n"
-        "<i>Рассчитываю расстояние и стоимость, это займет несколько секунд</i>",
-        reply_markup=kb_main()
+        "⏳ <b>Рассчитываю расстояние и стоимость...</b>\n"
+        "<i>Это займет несколько секунд</i>"
     )
     
-    def _background_calc():
-        try:
-            dist  = get_distance(data["from_city"], data["to_city"])
-            price = None
-            if dist:
-                dist  = round(dist * 1.25)
-                price = calc_price(dist, data["car_class"], data["from_city"], data["to_city"])
-                db_update_order(oid, distance_km=dist, price=price)
-            
-            db_update_order(oid, status="open")
-            order = db_get_order(oid)
-            
-            if dist:
-                warn = "📲 Ваш заказ опубликован в канале @intercitytrans.\nВодители увидят его и свяжутся с вами."
-            else:
-                warn = ("⚠️ <b>Расстояние не удалось рассчитать автоматически.</b>\n"
-                        "Стоимость будет уточнена после принятия заказа водителем.\n"
-                        "📲 Заказ опубликован в канале.")
-            
-            cancel_btn = types.InlineKeyboardMarkup()
-            cancel_btn.add(types.InlineKeyboardButton("❌ Отменить заказ", callback_data=f"cancel_{oid}"))
-            bot.send_message(uid,
-                "✅ <b>Заказ успешно создан!</b>\n\n" + fmt_order(order) + f"\n\n{warn}",
-                reply_markup=cancel_btn
-            )
-            
+    try:
+        dist = get_distance(data["from_city"], data["to_city"])
+        price = None
+        distance_km = None
+        
+        if dist:
+            distance_km = round(dist * 1.25)
+            price = calc_price(distance_km, data["car_class"], data["from_city"], data["to_city"])
+        
+        oid = db_create_order({
+            "passenger_id": uid,
+            "from_city":    data["from_city"],
+            "to_city":      data["to_city"],
+            "trip_date":    data["trip_date"],
+            "trip_time":    data["trip_time"],
+            "passengers":   data["passengers"],
+            "car_class":    data["car_class"],
+            "wishes":       data.get("wishes",""),
+            "distance_km":  distance_km,
+            "price":        price,
+            "status":       "open" if distance_km else "pending"
+        })
+        
+        order = db_get_order(oid)
+        
+        if distance_km:
+            warn = "📲 Ваш заказ опубликован в канале @intercitytrans.\nВодители увидят его и свяжутся с вами."
+        else:
+            warn = ("⚠️ <b>Расстояние не удалось рассчитать автоматически.</b>\n"
+                    "Стоимость будет уточнена после принятия заказа водителем.\n"
+                    "📲 Заказ опубликован в канале.")
+        
+        cancel_btn = types.InlineKeyboardMarkup()
+        cancel_btn.add(types.InlineKeyboardButton("❌ Отменить заказ", callback_data=f"cancel_{oid}"))
+        
+        bot.send_message(uid,
+            "✅ <b>Заказ успешно создан!</b>\n\n" + fmt_order(order) + f"\n\n{warn}",
+            reply_markup=cancel_btn
+        )
+        
+        if distance_km:
             _post_to_channel(oid)
             _notify_drivers(oid)
-            
-        except Exception as e:
-            print(f"❌ Ошибка в фоновом расчете заказа #{oid}: {e}")
-            bot.send_message(uid,
-                "❌ Произошла ошибка при расчете заказа.\n"
-                "Пожалуйста, попробуйте еще раз или обратитесь к администратору @Olegan7979"
-            )
-    
-    threading.Thread(target=_background_calc, daemon=True).start()
-
+        
+    except Exception as e:
+        print(f"❌ Ошибка при создании заказа: {e}")
+        bot.send_message(uid,
+            "❌ Произошла ошибка при создании заказа.\n"
+            "Пожалуйста, попробуйте еще раз или обратитесь к администратору @Olegan7979",
+            reply_markup=kb_main()
+        )
 
 def _post_to_channel(oid):
     if not GROUP_CHAT_ID:
@@ -938,6 +939,8 @@ def _notify_drivers(oid):
         did = drv["user_id"]
         if not is_subscribed(did):
             continue
+        if not drv.get("docs_verified"):
+            continue
         if drv.get("car_class") != cc:
             continue
         if old_car(drv.get("car_year", 2010)) and dist > 300:
@@ -952,7 +955,6 @@ def _notify_drivers(oid):
         except Exception as e:
             print(f"⚠️ Водитель {did}: {e}")
         time.sleep(0.05)
-
 
 # ═══════════════════════════════════════════════════════════════
 #  МОИ ЗАКАЗЫ
@@ -974,7 +976,6 @@ def my_orders(msg):
         if o["status"] in ("open", "taken"):
             m.add(types.InlineKeyboardButton("❌ Отменить заказ", callback_data=f"cancel_{o['id']}"))
         bot.send_message(uid, fmt_order(o), reply_markup=m)
-
 
 # ═══════════════════════════════════════════════════════════════
 #  ВОДИТЕЛЬ — МЕНЮ
@@ -1004,7 +1005,7 @@ def driver_enter(msg):
     bot.send_message(uid,
         "🚗 <b>Меню водителя</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>{drv.get('name','—')}</b>\n"
+        f"👤 <b>{drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')}</b>\n"
         f"🚘 {drv.get('car_model','—')}  {drv.get('car_year','—')} г.\n"
         f"🔢 {drv.get('car_number','—')}\n"
         f"🏷 {drv.get('car_class_label','—')}\n"
@@ -1025,8 +1026,15 @@ def avail_orders(msg):
         )
         return
     drv      = db_get_driver(uid)
-    cc       = drv.get("car_class","standard") if drv else "standard"
-    car_year = drv.get("car_year", 2010) if drv else 2010
+    if not drv or not drv.get("docs_verified"):
+        bot.send_message(uid,
+            "⏳ <b>Документы не подтверждены</b>\n\n"
+            "Дождитесь проверки документов администратором.\n"
+            "Статус проверки отображается в «Мой профиль»."
+        )
+        return
+    cc       = drv.get("car_class","standard")
+    car_year = drv.get("car_year", 2010)
     avail = [
         o for o in db_open_orders_for_class(cc)
         if not (old_car(car_year) and (o.get("distance_km") or 0) > 300)
@@ -1058,9 +1066,8 @@ def driver_trips(msg):
             m.add(types.InlineKeyboardButton("❌ Отказаться от заказа", callback_data=f"driver_cancel_{o['id']}"))
         bot.send_message(uid, fmt_order(o), reply_markup=m)
 
-
 # ═══════════════════════════════════════════════════════════════
-#  ПРОФИЛЬ ВОДИТЕЛЯ — FSM (12 шагов)
+#  ПРОФИЛЬ ВОДИТЕЛЯ — FSM
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
@@ -1069,20 +1076,24 @@ def profile_menu(msg):
     drv = db_get_driver(uid)
     if drv:
         docs_status = "✅ Проверены" if drv.get("docs_verified") else "⏳ На проверке у администратора"
+        profile_link = drv.get("profile_link", f"tg://user?id={uid}")
+        profile_html = f'<a href="{profile_link}">Открыть профиль</a>'
+        
         m = types.InlineKeyboardMarkup()
         m.add(types.InlineKeyboardButton("✏️ Изменить профиль", callback_data="edit_profile"))
         bot.send_message(uid,
             "👤 <b>Ваш профиль водителя</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 Имя:          <b>{drv.get('name','—')}</b>\n"
+            f"👤 Имя:          <b>{drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')}</b>\n"
             f"🚘 Авто:         <b>{drv.get('car_model','—')}</b>\n"
             f"📅 Год:          <b>{drv.get('car_year','—')}</b>\n"
             f"🔢 Гос. номер:   <b>{drv.get('car_number','—')}</b>\n"
             f"🏷 Класс:        <b>{drv.get('car_class_label','—')}</b>\n"
             f"📞 Телефон:      <b>{drv.get('phone','—')}</b>\n"
-            f"💬 Username:     <b>{drv.get('username','—')}</b>\n\n"
+            f"💬 Профиль:      {profile_html}\n\n"
             f"📄 Документы:    <b>{docs_status}</b>",
-            reply_markup=m
+            reply_markup=m,
+            parse_mode="HTML"
         )
     else:
         _start_profile(uid)
@@ -1161,6 +1172,26 @@ def p_number(msg):
         reply_markup=kb_pclass()
     )
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pclass_"))
+def pclass_callback(call):
+    uid = call.from_user.id
+    s = db_get_session(uid)
+    if s.get("step") != "profile_car_class":
+        bot.answer_callback_query(call.id, "❌ Ошибка сессии"); return
+    cc = call.data.split("_",1)[1]
+    lbl = TARIFFS_RF.get(cc,{}).get("label", cc)
+    s["data"]["car_class"] = cc
+    s["data"]["car_class_label"] = lbl
+    db_update_session(uid, step="profile_phone", data=s["data"])
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    bot.send_message(uid,
+        f"✅ Класс: <b>{lbl}</b>\n\n"
+        "<b>Шаг 6 / 12 — Номер телефона</b>\n"
+        "<i>Будет виден пассажирам при принятии заказа</i>\n"
+        "<i>Например: +79001234567</i>"
+    )
+    bot.answer_callback_query(call.id)
+
 @bot.message_handler(func=lambda m: db_get_session(m.chat.id).get("step") == "profile_phone")
 def p_phone(msg):
     uid   = msg.chat.id
@@ -1169,33 +1200,94 @@ def p_phone(msg):
         bot.send_message(uid, "❌ Введите корректный номер, например: +79001234567"); return
     s = db_get_session(uid)
     s["data"]["phone"] = phone
-    db_update_session(uid, step="profile_username", data=s["data"])
+    db_update_session(uid, step="profile_share_contact", data=s["data"])
+    
+    # Создаём клавиатуру с кнопкой "Поделиться контактом"
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    contact_btn = types.KeyboardButton("📱 Поделиться контактом", request_contact=True)
+    cancel_btn = types.KeyboardButton("❌ Отменить")
+    m.add(contact_btn)
+    m.add(cancel_btn)
+    
     bot.send_message(uid,
         f"✅ Телефон: <b>{phone}</b>\n\n"
-        "<b>Шаг 7 / 12 — Telegram username:</b>\n"
-        "<i>Например: @ivanov_driver</i>\n"
-        "<i>Если нет — напишите «нет»</i>"
+        "<b>Шаг 7 / 12 — Подтверждение личности</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "📱 Нажмите кнопку <b>«Поделиться контактом»</b>\n"
+        "Это необходимо для верификации вашего аккаунта.\n\n"
+        "⚠️ <i>Ваш профиль в Telegram должен быть заполнен:\n"
+        "• Имя и фамилия\n"
+        "• Фото профиля\n"
+        "• Описание (bio)</i>",
+        reply_markup=m
     )
 
-@bot.message_handler(func=lambda m: db_get_session(m.chat.id).get("step") == "profile_username")
-def p_username(msg):
+
+@bot.message_handler(content_types=["contact"], 
+                     func=lambda m: db_get_session(m.chat.id).get("step") == "profile_share_contact")
+def p_contact(msg):
     uid = msg.chat.id
-    u   = msg.text.strip()
-    if u.lower() == "нет":
-        u = f"@id{uid}"
-    elif not u.startswith("@"):
-        u = "@" + u
+    contact = msg.contact
+    
+    # Проверяем, что контакт принадлежит пользователю
+    if contact.user_id != uid:
+        bot.send_message(uid, "❌ Отправьте <b>свой</b> контакт, пожалуйста.")
+        return
+    
+    # Получаем данные профиля пользователя
+    try:
+        user_info = bot.get_chat(uid)
+        first_name = user_info.first_name or ""
+        last_name = user_info.last_name or ""
+        username = f"@{user_info.username}" if user_info.username else None
+        
+        # Проверяем наличие фото профиля
+        photos = bot.get_user_profile_photos(uid, limit=1)
+        has_photo = photos.total_count > 0
+        
+        # Проверяем bio (описание)
+        bio = user_info.bio if hasattr(user_info, 'bio') else ""
+        
+    except Exception as e:
+        print(f"⚠️ Ошибка получения профиля: {e}")
+        bot.send_message(uid, 
+            "❌ Не удалось получить данные профиля.\n"
+            "Убедитесь, что ваш профиль в Telegram открыт.\n"
+            "Попробуйте ещё раз или обратитесь к @Olegan7979")
+        return
+    
     s = db_get_session(uid)
-    s["data"]["username"] = u
+    s["data"]["username"] = username or f"tg://user?id={uid}"
+    s["data"]["first_name"] = first_name
+    s["data"]["last_name"] = last_name
+    s["data"]["has_photo"] = has_photo
+    s["data"]["bio"] = bio
+    
+    # Формируем ссылку на профиль
+    if username:
+        profile_link = f"https://t.me/{username.lstrip('@')}"
+    else:
+        profile_link = f"tg://user?id={uid}"
+    
+    s["data"]["profile_link"] = profile_link
+    
     db_update_session(uid, step="profile_doc_lic_front", data=s["data"])
+    
+    full_name = f"{first_name} {last_name}".strip()
+    
+    # Восстанавливаем обычную клавиатуру с отменой
     bot.send_message(uid,
-        f"✅ Username: <b>{u}</b>\n\n"
+        f"✅ Контакт получен!\n\n"
+        f"👤 Имя: <b>{full_name}</b>\n"
+        f"{'📸 Фото профиля: ✅' if has_photo else '⚠️ Фото профиля: отсутствует'}\n"
+        f"{'📝 Описание: ✅' if bio else '⚠️ Описание: отсутствует'}\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "📄 <b>Загрузка документов</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "<b>Шаг 8 / 12 — Водительское удостоверение</b>\n\n"
         "📸 Отправьте фото <b>лицевой стороны</b> прав\n"
-        "<i>Данные должны быть чётко видны</i>"
+        "<i>Данные должны быть чётко видны</i>",
+        reply_markup=kb_cancel_reply()
     )
 
 @bot.message_handler(
@@ -1213,18 +1305,13 @@ def p_photo(msg):
 
     step_map = {
         "profile_doc_lic_front": ("doc_lic_front", "profile_doc_lic_back",
-            "✅ Лицевая сторона прав получена\n\n"
-            "<b>Шаг 9 / 12</b> — 📸 Обратная сторона прав:"),
+            "✅ Лицевая сторона прав получена\n\n<b>Шаг 9 / 12</b> — 📸 Обратная сторона прав:"),
         "profile_doc_lic_back":  ("doc_lic_back",  "profile_doc_sts_front",
-            "✅ Обратная сторона прав получена\n\n"
-            "<b>Шаг 10 / 12</b> — 📸 Лицевая сторона СТС:"),
+            "✅ Обратная сторона прав получена\n\n<b>Шаг 10 / 12</b> — 📸 Лицевая сторона СТС:"),
         "profile_doc_sts_front": ("doc_sts_front", "profile_doc_sts_back",
-            "✅ Лицевая сторона СТС получена\n\n"
-            "<b>Шаг 11 / 12</b> — 📸 Обратная сторона СТС:"),
+            "✅ Лицевая сторона СТС получена\n\n<b>Шаг 11 / 12</b> — 📸 Обратная сторона СТС:"),
         "profile_doc_sts_back":  ("doc_sts_back",  "profile_doc_car",
-            "✅ Обратная сторона СТС получена\n\n"
-            "<b>Шаг 12 / 12</b> — 📸 Фото автомобиля целиком\n"
-            "<i>Гос. номер должен быть виден</i>"),
+            "✅ Обратная сторона СТС получена\n\n<b>Шаг 12 / 12</b> — 📸 Фото автомобиля целиком\n<i>Гос. номер должен быть виден</i>"),
         "profile_doc_car":       ("doc_car", None, None),
     }
     field, next_step, next_msg = step_map[step]
@@ -1245,20 +1332,29 @@ def _finalize_profile(uid):
     db_save_driver(uid, data)
     db_clear_session(uid)
 
+    # Формируем ссылку на профиль
+    profile_link = data.get("profile_link", f"tg://user?id={uid}")
+    profile_html = f'<a href="{profile_link}">Открыть профиль</a>'
+    full_name = f"{data.get('first_name', data.get('name', '—'))} {data.get('last_name', '')}"
+
     bot.send_message(uid,
         "🎉 <b>Профиль успешно создан!</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 {data['name']}\n"
+        f"👤 {full_name}\n"
         f"🚘 {data['car_model']} ({data['car_year']} г.)\n"
         f"🔢 {data.get('car_number','—')}\n"
         f"🏷 {data.get('car_class_label','—')}\n"
         f"📞 {data['phone']}\n"
-        f"💬 {data.get('username','—')}\n\n"
+        f"💬 {profile_html}\n\n"
         "📄 Документы отправлены на проверку администратору.\n"
         "После проверки вы получите уведомление.\n\n"
-        "💳 Следующий шаг — оформите <b>абонемент</b>.",
-        reply_markup=kb_driver(uid)
+        "💳 <b>Следующий шаг — оформите абонемент:</b>",
+        reply_markup=kb_driver(uid),
+        parse_mode="HTML"
     )
+    
+    # Сразу показываем меню абонемента
+    subscription_menu_after_registration(uid)
 
     drv = db_get_driver(uid)
     for admin_id in ADMIN_IDS:
@@ -1268,18 +1364,28 @@ def _finalize_profile(uid):
                 types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"doc_ok_{uid}"),
                 types.InlineKeyboardButton("❌ Отклонить",   callback_data=f"doc_rej_{uid}")
             )
-            bot.send_message(admin_id,
+            
+            # Формируем информацию о профиле
+            has_photo = data.get("has_photo", False)
+            bio = data.get("bio", "")
+            
+            admin_msg = (
                 "📋 <b>Новый водитель — проверка документов</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 {drv.get('name','—')}\n"
-                f"🚘 {drv.get('car_model','—')} ({drv.get('car_year','—')} г.)\n"
-                f"🔢 {drv.get('car_number','—')}\n"
-                f"🏷 {drv.get('car_class_label','—')}\n"
-                f"📞 {drv.get('phone','—')}\n"
-                f"💬 {drv.get('username','—')}\n"
+                f"👤 <b>{full_name}</b>\n"
+                f"🚘 {data.get('car_model','—')} ({data.get('car_year','—')} г.)\n"
+                f"🔢 {data.get('car_number','—')}\n"
+                f"🏷 {data.get('car_class_label','—')}\n"
+                f"📞 {data.get('phone','—')}\n"
+                f"💬 {profile_link}\n"
+                f"📸 Фото профиля: {'✅' if has_photo else '❌'}\n"
+                f"📝 Bio: {'✅' if bio else '❌'}\n"
                 f"ID: <code>{uid}</code>\n\n"
                 "📸 Документы — в следующих сообщениях:"
             )
+            
+            bot.send_message(admin_id, admin_msg, parse_mode="HTML")
+            
             for field, caption in [
                 ("doc_lic_front", "📄 Права — лицевая"),
                 ("doc_lic_back",  "📄 Права — обратная"),
@@ -1298,6 +1404,17 @@ def _finalize_profile(uid):
         except Exception as e:
             print(f"⚠️ Уведомление админа {admin_id}: {e}")
 
+
+def subscription_menu_after_registration(uid):
+    """Показывает меню абонемента сразу после регистрации"""
+    text = (
+        "💳 <b>Оформление абонемента</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "❌ Активной подписки нет\n\n"
+        "Без абонемента заказы недоступны.\n"
+        "Выберите тариф:"
+    )
+    bot.send_message(uid, text, reply_markup=kb_subscriptions())
 
 # ═══════════════════════════════════════════════════════════════
 #  АБОНЕМЕНТ
@@ -1326,16 +1443,77 @@ def subscription_menu(msg):
         )
     bot.send_message(uid, text, reply_markup=kb_subscriptions())
 
-@bot.message_handler(func=lambda m: m.text and "подписка" in m.text.lower())
-def sub_status_btn(msg):
-    uid = msg.chat.id
-    dl  = days_left(uid)
-    if dl > 0:
-        bot.send_message(uid, f"✅ Подписка активна, осталось {dl} дн.")
-    else:
-        bot.send_message(uid, "❌ Подписка не активна. Нажмите «Абонемент».")
+# ═══════════════════════════════════════════════════════════════
+#  АДМИН КОМАНДЫ
+# ═══════════════════════════════════════════════════════════════
 
+@bot.message_handler(commands=["ban"])
+def cmd_ban(msg):
+    if msg.chat.id not in ADMIN_IDS:
+        bot.reply_to(msg, "❌ Нет доступа.")
+        return
 
+    try:
+        target_user_id = int(msg.text.split()[1])
+    except (IndexError, ValueError):
+        bot.reply_to(msg, "⚠️ Использование: /ban 123456789")
+        return
+
+    db_add_blacklist(target_user_id)
+    bot.reply_to(msg, f"⛔ {target_user_id} добавлен в ЧС")
+    try:
+        bot.send_message(target_user_id, "⛔ Вы заблокированы в системе.")
+    except:
+        pass
+
+@bot.message_handler(commands=["unban"])
+def cmd_unban(msg):
+    if msg.chat.id not in ADMIN_IDS:
+        bot.reply_to(msg, "❌ Нет доступа.")
+        return
+
+    try:
+        target_user_id = int(msg.text.split()[1])
+    except (IndexError, ValueError):
+        bot.reply_to(msg, "⚠️ Использование: /unban 123456789")
+        return
+
+    db_remove_blacklist(target_user_id)
+    bot.reply_to(msg, f"✅ {target_user_id} удалён из ЧС")
+
+@bot.message_handler(commands=["unsub"])
+def cmd_unsubscribe(msg):
+    if msg.chat.id not in ADMIN_IDS:
+        bot.reply_to(msg, "❌ Нет доступа.")
+        return
+
+    try:
+        target_user_id = int(msg.text.split()[1])
+    except (IndexError, ValueError):
+        bot.reply_to(msg, "⚠️ Использование: /unsub 123456789\nГде 123456789 — ID водителя")
+        return
+
+    conn = get_db()
+    conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (target_user_id,))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(msg, f"✅ Подписка пользователя {target_user_id} аннулирована.")
+
+    try:
+        bot.send_message(target_user_id, "⛔ Ваш абонемент был аннулирован администратором. Подробности уточняйте в поддержке.")
+    except:
+        pass
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(msg):
+    if msg.chat.id not in ADMIN_IDS:
+        return
+    s = db_stats()
+    bot.send_message(msg.chat.id,
+        f"📊 Заказов: {s['total']} | Открыто: {s['open']} | Завершено: {s['done']}\n"
+        f"🚗 Водителей: {s['drivers']} | С подпиской: {s['subscribed']}"
+    )
 # ═══════════════════════════════════════════════════════════════
 #  CALLBACKS
 # ═══════════════════════════════════════════════════════════════
@@ -1372,23 +1550,6 @@ def on_callback(call):
         ask_wishes(uid)
         bot.answer_callback_query(call.id)
 
-    elif data.startswith("pclass_"):
-        if s.get("step") != "profile_car_class":
-            bot.answer_callback_query(call.id, "❌ Ошибка сессии"); return
-        cc  = data.split("_",1)[1]
-        lbl = TARIFFS_RF.get(cc,{}).get("label", cc)
-        s["data"]["car_class"]       = cc
-        s["data"]["car_class_label"] = lbl
-        db_update_session(uid, step="profile_phone", data=s["data"])
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(uid,
-            f"✅ Класс: <b>{lbl}</b>\n\n"
-            "<b>Шаг 6 / 12 — Номер телефона</b>\n"
-            "<i>Будет виден пассажирам при принятии заказа</i>\n"
-            "<i>Например: +79001234567</i>"
-        )
-        bot.answer_callback_query(call.id)
-
     elif data == "cancel_order":
         db_clear_session(uid)
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
@@ -1418,7 +1579,12 @@ def on_callback(call):
         bot.answer_callback_query(call.id)
 
     elif data.startswith("driver_cancel_"):
-        oid   = int(data.split("_")[2])
+        # Безопасное извлечение ID заказа
+        parts = data.split("_")
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "❌ Ошибка данных")
+            return
+        oid   = int(parts[2])
         order = db_get_order(oid)
         if not order:
             bot.answer_callback_query(call.id, "❌ Заказ не найден"); return
@@ -1447,6 +1613,40 @@ def on_callback(call):
     elif data.startswith("take_"):
         oid = int(data.split("_")[1])
         
+        # Все проверки ДО изменения статуса заказа
+        drv = db_get_driver(uid)
+        if not drv or not drv.get("docs_verified"):
+            bot.answer_callback_query(call.id, "❌ Документы не подтверждены администратором", show_alert=True)
+            return
+        
+        if not is_subscribed(uid):
+            bot.answer_callback_query(call.id, "❌ Нет активного абонемента", show_alert=True)
+            return
+        
+        order = db_get_order(oid)
+        if not order:
+            bot.answer_callback_query(call.id, "❌ Заказ не найден")
+            return
+        
+        if order["status"] != "open":
+            bot.answer_callback_query(call.id, "⚠️ Заказ уже взят другим водителем или недоступен")
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            return
+        
+        if drv.get("car_class") != order.get("car_class"):
+            bot.answer_callback_query(call.id, "❌ Класс вашего авто не соответствует заказу", show_alert=True)
+            return
+        
+        car_year = drv.get("car_year", 2010)
+        dist = order.get("distance_km") or 0
+        if old_car(car_year) and dist > 300:
+            bot.answer_callback_query(call.id,
+                f"❌ Ваш автомобиль {car_year} г.в. — заказы только до 300 км (здесь ~{dist:.0f} км)",
+                show_alert=True
+            )
+            return
+        
+        # Все проверки пройдены — выполняем атомарное обновление
         conn = get_db()
         cursor = conn.execute(
             "UPDATE orders SET status='taken', driver_id=?, taken_at=? WHERE id=? AND status='open'",
@@ -1454,31 +1654,13 @@ def on_callback(call):
         )
         if cursor.rowcount == 0:
             conn.close()
-            bot.answer_callback_query(call.id, "⚠️ Заказ уже взят другим водителем или недоступен")
+            bot.answer_callback_query(call.id, "⚠️ Заказ уже взят другим водителем")
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
             return
         conn.commit()
         conn.close()
         
         order = db_get_order(oid)
-        if not order:
-            bot.answer_callback_query(call.id, "❌ Заказ не найден"); return
-        
-        if not is_subscribed(uid):
-            db_update_order(oid, status="open", driver_id=None, taken_at=None)
-            bot.answer_callback_query(call.id, "❌ Нет активного абонемента"); return
-
-        drv = db_get_driver(uid) or {}
-        car_year = drv.get("car_year", 2010)
-        dist = order.get("distance_km") or 0
-        if old_car(car_year) and dist > 300:
-            db_update_order(oid, status="open", driver_id=None, taken_at=None)
-            bot.answer_callback_query(call.id,
-                f"❌ Ваш автомобиль {car_year} г.в. — заказы только до 300 км (здесь ~{dist:.0f} км)",
-                show_alert=True
-            )
-            return
-
         passenger_id = order["passenger_id"]
 
         try:
@@ -1520,7 +1702,7 @@ def on_callback(call):
             bot.send_message(passenger_id,
                 f"🎉 <b>Водитель найден! Заказ #{oid}</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 <b>{drv.get('name','—')}</b>\n"
+                f"👤 <b>{drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')}</b>\n"
                 f"🚘 {drv.get('car_model','—')}  {drv.get('car_year','—')} г.\n"
                 f"🔢 Гос. номер: <b>{drv.get('car_number','—')}</b>\n"
                 f"🏷 Класс: {drv.get('car_class_label','—')}\n"
@@ -1596,7 +1778,7 @@ def on_callback(call):
                 bot.send_message(admin_id,
                     "💳 <b>Запрос на абонемент</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n\n"
-                    f"👤 {drv.get('name','—')}\n"
+                    f"👤 {drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')}\n"
                     f"🚘 {drv.get('car_model','—')}\n"
                     f"🏷 {drv.get('car_class_label','—')}\n"
                     f"Тариф: <b>{plan['label']}</b>\n"
@@ -1621,7 +1803,7 @@ def on_callback(call):
             try:
                 bot.send_message(admin_id,
                     f"🔔 <b>Пользователь сообщил об оплате!</b>\n"
-                    f"👤 {drv.get('name','—')} (ID: {uid})\n"
+                    f"👤 {drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')} (ID: {uid})\n"
                     f"Тариф: {plan.get('label','—')}\n\n"
                     "Проверьте оплату и активируйте подписку."
                 )
@@ -1735,10 +1917,11 @@ def on_callback(call):
             dl   = days_left(d["user_id"])
             sub  = f"✅ {dl}д." if dl > 0 else "❌"
             docs = "✅" if d.get("docs_verified") else "⏳"
-            text += (f"👤 <b>{d.get('name','—')}</b>  {sub}  {docs}\n"
+            full_name = f"{d.get('first_name', d.get('name','—'))} {d.get('last_name', '')}"
+            text += (f"👤 <b>{full_name}</b>  {sub}  {docs}\n"
                      f"   {d.get('car_model','—')} · {d.get('car_class_label','—')}\n"
                      f"   📞 {d.get('phone','—')} · ID: <code>{d['user_id']}</code>\n\n")
-        bot.send_message(uid, text[:4000])
+        bot.send_message(uid, text[:4000] + ("..." if len(text) > 4000 else ""))
         bot.answer_callback_query(call.id)
 
     elif data == "adm_docs":
@@ -1755,8 +1938,9 @@ def on_callback(call):
                 types.InlineKeyboardButton("✅ Одобрить",  callback_data=f"doc_ok_{d['user_id']}"),
                 types.InlineKeyboardButton("❌ Отклонить", callback_data=f"doc_rej_{d['user_id']}")
             )
+            full_name = f"{d.get('first_name', d.get('name','—'))} {d.get('last_name', '')}"
             bot.send_message(uid,
-                f"👤 {d.get('name','—')} · {d.get('car_model','—')}\n"
+                f"👤 {full_name} · {d.get('car_model','—')}\n"
                 f"📞 {d.get('phone','—')} · ID: {d['user_id']}",
                 reply_markup=m
             )
@@ -1788,8 +1972,9 @@ def on_callback(call):
                 types.InlineKeyboardButton("❌ Отклонить",
                     callback_data=f"rej_sub_{p['user_id']}")
             )
+            full_name = f"{drv.get('first_name', drv.get('name','—'))} {drv.get('last_name', '')}"
             bot.send_message(uid,
-                f"💳 {drv.get('name','—')} (ID: {p['user_id']})\n"
+                f"💳 {full_name} (ID: {p['user_id']})\n"
                 f"Тариф: {plan.get('label','—')}",
                 reply_markup=m
             )
@@ -1812,44 +1997,49 @@ def on_callback(call):
         )
         bot.answer_callback_query(call.id)
 
-    else:
+    elif data == "adm_help":
+        if uid not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "❌")
+            return
+        help_text = """
+📖 <b>КОМАНДЫ АДМИНИСТРАТОРА</b>
+━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📋 Все заказы</b>
+Показать последние 10 заказов
+
+<b>👥 Водители</b>
+Список всех водителей с их статусом
+
+<b>📄 Проверить документы</b>
+Просмотр и подтверждение/отклонение документов водителей
+
+<b>⛔ Чёрный список</b>
+Управление заблокированными пользователями
+
+<b>💳 Ожидают оплаты</b>
+Запросы на покупку абонемента
+
+<b>📊 Статистика</b>
+Общая статистика по боту
+
+<b>🆕 /ban &lt;ID&gt;</b>
+Заблокировать пользователя
+
+<b>🆕 /unban &lt;ID&gt;</b>
+Разблокировать пользователя
+
+<b>🆕 /unsub &lt;ID&gt;</b>
+Аннулировать абонемент водителя
+
+━━━━━━━━━━━━━━━━━━━━━━
+💡 <i>Чтобы узнать ID пользователя, нажмите «👥 Водители»</i>
+"""
+        bot.send_message(uid, help_text, parse_mode="HTML")
         bot.answer_callback_query(call.id)
 
-
-# ═══════════════════════════════════════════════════════════════
-#  ADMIN COMMANDS
-# ═══════════════════════════════════════════════════════════════
-
-@bot.message_handler(commands=["ban"])
-def cmd_ban(msg):
-    if msg.chat.id not in ADMIN_IDS: return
-    try:
-        tgt = int(msg.text.split()[1])
-        db_add_blacklist(tgt)
-        bot.send_message(msg.chat.id, f"⛔ {tgt} добавлен в ЧС")
-        try: bot.send_message(tgt, "⛔ Вы заблокированы в системе.")
-        except: pass
-    except Exception as e:
-        bot.send_message(msg.chat.id, f"Использование: /ban <user_id>\nОшибка: {e}")
-
-@bot.message_handler(commands=["unban"])
-def cmd_unban(msg):
-    if msg.chat.id not in ADMIN_IDS: return
-    try:
-        tgt = int(msg.text.split()[1])
-        db_remove_blacklist(tgt)
-        bot.send_message(msg.chat.id, f"✅ {tgt} удалён из ЧС")
-    except Exception as e:
-        bot.send_message(msg.chat.id, f"Использование: /unban <user_id>\nОшибка: {e}")
-
-@bot.message_handler(commands=["stats"])
-def cmd_stats(msg):
-    if msg.chat.id not in ADMIN_IDS: return
-    s = db_stats()
-    bot.send_message(msg.chat.id,
-        f"📊 Заказов: {s['total']} | Открыто: {s['open']} | Завершено: {s['done']}\n"
-        f"🚗 Водителей: {s['drivers']} | С подпиской: {s['subscribed']}"
-    )
+    else:
+        bot.answer_callback_query(call.id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1885,7 +2075,7 @@ def fallback(msg):
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  🚕  МЕЖГОРОД ТРАНСФЕР РОССИЯ  v3.3  (SQLite FSM)")
+    print("  🚕  МЕЖГОРОД ТРАНСФЕР РОССИЯ  v4.0  (SQLite FSM, контакты + авторегистрация)")
     print("=" * 55)
     init_db()
     print(f"  📢 Канал:          {GROUP_CHAT_ID}")
